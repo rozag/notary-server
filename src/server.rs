@@ -99,6 +99,9 @@ pub async fn run_server(config: &NotaryServerProperties) -> Result<(), NotarySer
         let protocol = protocol.clone();
         let service = MakeService::<_, Request<hyper::Body>>::make_service(&mut app, &stream);
 
+        // TODO: idea at the moment: acceptor.accept future resolves after successful
+        // handshake, TLS-less version could use the stream right away?
+
         // Spawn a new async task to handle the new connection
         tokio::spawn(async move {
             match acceptor.accept(stream).await {
