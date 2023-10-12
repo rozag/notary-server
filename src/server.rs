@@ -72,11 +72,6 @@ pub async fn run_server(config: &NotaryServerProperties) -> Result<(), NotarySer
     let listener = AddrIncoming::from_listener(listener)
         .map_err(|err| eyre!("Failed to build hyper tcp listener: {err}"))?;
 
-    info!(
-        "Listening for TLS-secured TCP traffic at {}",
-        notary_address
-    );
-
     let protocol = Arc::new(Http::new());
     let notary_globals = NotaryGlobals::new(notary_signing_key, config.notarization.clone());
     let router = Router::new()
@@ -91,12 +86,19 @@ pub async fn run_server(config: &NotaryServerProperties) -> Result<(), NotarySer
 
     match tls_config {
         Some(tls_config) => {
+            info!(
+                "Listening for TLS-secured TCP traffic at {}",
+                notary_address
+            );
             let acceptor = TlsAcceptor::from(tls_config);
             run_tls_loop(listener, acceptor, protocol, &mut app).await
         }
         None => {
-            // TODO: run TLS-less server
-            todo!("Run TLS-less server")
+            info!(
+                "Listening for raw (without TLS) TCP traffic at {}",
+                notary_address
+            );
+            run_tls_less_loop(listener, protocol, &mut app).await
         }
     }
 }
@@ -150,6 +152,46 @@ async fn run_tls_loop(
                     );
                 }
             }
+        });
+    }
+}
+
+async fn run_tls_less_loop(
+    mut listener: AddrIncoming,
+    protocol: Arc<Http>,
+    app: &mut IntoMakeService<Router>,
+) -> Result<(), NotaryServerError> {
+    loop {
+        // Poll and await for any incoming connection, ensure that all operations inside are
+        // infallible to prevent bringing down the server
+        let (prover_address, stream) =
+            match poll_fn(|cx| Pin::new(&mut listener).poll_accept(cx)).await {
+                Some(Ok(connection)) => (connection.remote_addr(), connection),
+                Some(Err(err)) => {
+                    error!("{}", NotaryServerError::Connection(err.to_string()));
+                    continue;
+                }
+                None => unreachable!("The poll_accept method should never return None"),
+            };
+        debug!(?prover_address, "Received a prover's TCP connection");
+
+        let protocol = protocol.clone();
+        let service = MakeService::<_, Request<hyper::Body>>::make_service(app, &stream);
+
+        // Spawn a new async task to handle the new connection
+        tokio::spawn(async move {
+            info!(
+                ?prover_address,
+                "Accepted prover's raw (without TLS) TCP connection",
+            );
+            // Serve different requests using the same hyper protocol and axum router
+            let _ = protocol
+                // Can unwrap because it's infallible
+                .serve_connection(stream, service.await.unwrap())
+                // use with_upgrades to upgrade connection to websocket for websocket clients
+                // and to extract tcp connection for tcp clients
+                .with_upgrades()
+                .await;
         });
     }
 }
